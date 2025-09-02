@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flying Fox – Interaktive Kettenlinie</title>
+  <style>
+    :root {
+      --bg: #0b0f14;        /* dunkler Hintergrund */
+      --fg: #e8ecf1;        /* helle Schrift */
+      --muted: #9fb0c3;     /* Nebeninfos */
+      --accent: #5aa9e6;    /* Akzent */
+      --accent2: #7dd3a9;   /* zweite Akzentfarbe */
+      --grid: #233140;      /* Gitterlinien */
+      --rope: #f8c146;      /* Seilfarbe */
+      --anchorL: #ff7d7d;   /* linker Anker */
+      --anchorR: #9ad0ff;   /* rechter Anker/Mast */
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; background: var(--bg); color: var(--fg);}    
+    header { padding: 12px 16px; border-bottom: 1px solid #14202b; }
+    header h1 { margin: 0 0 8px 0; font-size: 18px; letter-spacing: .2px; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+    .ctrl { display:flex; flex-direction:column; gap:4px; }
+    .ctrl label { font-size: 12px; color: var(--muted); }
+    .ctrl input { padding: 6px 8px; font-size: 14px; width: 120px; border-radius: 8px; border: 1px solid #2a3a4d; background:#0e141b; color:var(--fg);}
+    .ctrl input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    main { display: grid; grid-template-columns: 1fr; gap: 8px; padding: 8px 12px 20px; }
+    #wrap { position: relative; }
+    #canvas { width: 100%; height: 560px; background: #0d141b; border-radius: 12px; border:1px solid #152230; display:block; }
+    .readout { display:flex; flex-wrap: wrap; gap:16px; margin-top: 8px; font-size: 14px; color: var(--muted);}
+    .readout .badge { background:#132130; color:#cfe7ff; border:1px solid #203246; padding:4px 8px; border-radius: 8px; }
+    .legend { font-size: 12px; color: var(--muted); }
+    .help { margin-top: 4px; font-size: 12px; color:#a2b9cc;}
+    @media (max-width: 900px){ .ctrl input{ width: 100px;} }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Flying Fox – Interaktive Kettenlinie (50 m Beispiel, SI-Einheiten)</h1>
+    <div class="row">
+      <div class="ctrl"><label for="ropeLen">Seillänge L (m, nominal/ungedehnt)</label><input id="ropeLen" type="number" step="0.1" value="50"></div>
+      <div class="ctrl"><label for="elong">Dehnung ε (%) bei aktueller Last (vereinfachte Annahme)</label><input id="elong" type="number" step="0.1" value="1"></div>
+      <div class="ctrl"><label for="linDen">Lineargewicht ρ (kg/m)</label><input id="linDen" type="number" step="0.005" value="0.03"></div>
+      <div class="ctrl"><label for="pret">Vorspannung H (kN) – horizontale Seilkraft</label><input id="pret" type="number" step="0.1" value="3"></div>
+      <div class="ctrl"><label for="mastH">Mast-Höhe rechts (m)</label><input id="mastH" type="number" step="0.1" value="5"></div>
+      <div class="ctrl"><label for="span">Darstellungsbreite (m, horizontale Skala)</label><input id="span" type="number" step="1" value="50"></div>
+    </div>
+    <div class="help">Linker Anker: per Drag&Drop verschiebbar. Rechter Anker: fix, <b>10 px Mast</b> (Höhe einstellbar). Die Kurve nutzt die Kettenlinienform mit einstellbarer Vorspannung und Seilgewicht. Die Dehnung wird als globale Längenänderung (vereinfachte Annahme) berücksichtigt und mit der geometrischen Bogenlänge verglichen.</div>
+  </header>
+  <main>
+    <div id="wrap">
+      <canvas id="canvas" width="1200" height="560"></canvas>
+    </div>
+    <div class="readout" id="readout"></div>
+  </main>
+
+  <script>
+  (function(){
+    const g = 9.81; // m/s^2
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    // Inputs
+    const ropeLenEl = document.getElementById('ropeLen');
+    const elongEl   = document.getElementById('elong');
+    const linDenEl  = document.getElementById('linDen');
+    const pretEl    = document.getElementById('pret');
+    const mastHEl   = document.getElementById('mastH');
+    const spanEl    = document.getElementById('span');
+    const outEl     = document.getElementById('readout');
+
+    // World-to-canvas mapping
+    const margin = {left: 60, right: 30, top: 20, bottom: 40};
+
+    function getScales(){
+      const spanM = Math.max(5, Number(spanEl.value) || 50); // horiz domain in meters
+      const w = canvas.width - margin.left - margin.right;
+      const pxPerM_X = w / spanM;
+      // vertical: auto scale to 10 m window default; adjust dynamically later
+      const pxPerM_Y = (canvas.height - margin.top - margin.bottom) / 10; // default 10 m vertical range
+      return {pxPerM_X, pxPerM_Y, spanM};
+    }
+
+    // Anchor state (in meters)
+    let leftAnchor = { x: 5, y: 4 };     // default 5 m rechts vom Rand, 4 m Höhe
+    let rightAnchor = { x: null, y: 5 };  // x wird aus span gesetzt, y aus mastHEl
+
+    // Drag handling (left anchor only)
+    let dragging = false;
+    function canvasToWorld(px, py){
+      const {pxPerM_X, pxPerM_Y, spanM} = getScales();
+      const x = (px - margin.left) / pxPerM_X; // meters
+      const y = (canvas.height - margin.bottom - py) / pxPerM_Y; // meters above ground
+      return {x, y};
+    }
+    function worldToCanvas(x, y){
+      const {pxPerM_X, pxPerM_Y} = getScales();
+      const px = margin.left + x * pxPerM_X;
+      const py = canvas.height - margin.bottom - y * pxPerM_Y;
+      return {x: px, y: py};
+    }
+
+    canvas.addEventListener('mousedown', (e)=>{
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left; const my = e.clientY - rect.top;
+      const la = worldToCanvas(leftAnchor.x, leftAnchor.y);
+      const r = 10; // px hit radius
+      if(Math.hypot(mx - la.x, my - la.y) <= r+4){ dragging = true; }
+    });
+    window.addEventListener('mouseup', ()=> dragging = false);
+    window.addEventListener('mousemove', (e)=>{
+      if(!dragging) return;
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left; const my = e.clientY - rect.top;
+      const wpt = canvasToWorld(mx, my);
+      // constrain within span and ≥ 0 m height
+      const {spanM} = getScales();
+      leftAnchor.x = Math.min(Math.max(0, wpt.x), spanM-0.5);
+      leftAnchor.y = Math.max(0, wpt.y);
+      scheduleRender();
+    });
+
+    // Inputs change
+    [ropeLenEl, elongEl, linDenEl, pretEl, mastHEl, spanEl].forEach(el=>{
+      el.addEventListener('input', ()=>{
+        // keep anchors within new span
+        const {spanM} = getScales();
+        rightAnchor.x = spanM; // fixed on the right edge of domain
+        rightAnchor.y = Math.max(0, Number(mastHEl.value)||5);
+        leftAnchor.x = Math.min(leftAnchor.x, spanM-0.5);
+        scheduleRender();
+      });
+    });
+
+    // Catenary computation
+    function computeCatenary(x1,y1,x2,y2,H,w){
+      // H in N, w in N/m. a = H/w
+      const a = H / w; // meters
+      // Solve for x_c using f(xc) = y2 - y1 - a[cosh((x2-xc)/a) - cosh((x1-xc)/a)] = 0
+      function f(xc){
+        const u2 = (x2 - xc)/a; const u1 = (x1 - xc)/a;
+        return (y2 - y1) - a*(Math.cosh(u2) - Math.cosh(u1));
+      }
+      // bracket xc roughly between x1-10a and x2+10a
+      let lo = Math.min(x1,x2) - 10*a, hi = Math.max(x1,x2) + 10*a;
+      // ensure sign change; widen if needed
+      let flo = f(lo), fhi = f(hi);
+      let expand = 0;
+      while(flo*fhi > 0 && expand < 10){
+        lo -= 10*a; hi += 10*a; flo = f(lo); fhi = f(hi); expand++;
+      }
+      // bisection
+      for(let i=0;i<80;i++){
+        const mid = 0.5*(lo+hi); const fm = f(mid);
+        if(Math.abs(fm) < 1e-9) { lo=hi=mid; break; }
+        if(flo*fm <= 0){ hi = mid; fhi = fm; } else { lo = mid; flo = fm; }
+      }
+      const xc = 0.5*(lo+hi);
+      const u1 = (x1 - xc)/a, u2 = (x2 - xc)/a;
+      const y0 = y1 - a*Math.cosh(u1);
+      const yMin = y0 + a; // at x = xc
+      const xMin = xc;
+      const length = a*(Math.sinh(u2) - Math.sinh(u1));
+      return {a, xc, y0, xMin, yMin, length};
+    }
+
+    // Rendering
+    let rafId = null, lastFrame = 0;
+    function scheduleRender(){
+      if(rafId) return; // throttle to next frame
+      rafId = requestAnimationFrame((ts)=>{
+        rafId = null;
+        if(ts - lastFrame < 16) { // ~60 fps throttle
+          requestAnimationFrame(render);
+        } else {
+          render();
+          lastFrame = ts;
+        }
+      });
+    }
+
+    function render(){
+      const {pxPerM_X, pxPerM_Y, spanM} = getScales();
+      rightAnchor.x = spanM;
+      rightAnchor.y = Math.max(0, Number(mastHEl.value)||5);
+
+      // Inputs
+      const L_nom = Math.max(1, Number(ropeLenEl.value) || 50); // m
+      const eps   = Math.max(0, Number(elongEl.value) || 0)/100; // fraction
+      const rho   = Math.max(0.001, Number(linDenEl.value) || 0.03); // kg/m
+      const wNpm  = rho * g; // N/m
+      const HkN   = Math.max(0.1, Number(pretEl.value) || 3);
+      const H     = HkN * 1000; // N
+
+      // Compute catenary
+      const x1 = leftAnchor.x, y1 = leftAnchor.y;
+      const x2 = rightAnchor.x, y2 = rightAnchor.y;
+
+      let cat = null, ok = true, msg = "";
+      try { cat = computeCatenary(x1,y1,x2,y2,H,wNpm); }
+      catch(e){ ok = false; msg = e.message || String(e); }
+
+      // Clear
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+
+      // Axes/grid
+      drawGrid(pxPerM_X, pxPerM_Y, spanM);
+
+      // Mast (right)
+      const mastW = 10; // px
+      const mastBase = worldToCanvas(x2, 0);
+      const mastTop  = worldToCanvas(x2, y2);
+      ctx.fillStyle = 'rgba(154,208,255,0.85)';
+      ctx.fillRect(mastTop.x - mastW/2, mastTop.y, mastW, mastBase.y - mastTop.y);
+
+      // Anchors markers
+      drawAnchor(leftAnchor.x, leftAnchor.y, '--L', getCSS('--anchorL'));
+      drawAnchor(rightAnchor.x, rightAnchor.y, '--R', getCSS('--anchorR'), true);
+
+      // Rope curve
+      let S_geom = 0, S_eff = L_nom*(1+eps);
+      let yMin = NaN, xMin = NaN;
+
+      if(ok && isFinite(cat.length)){
+        // draw catenary
+        ctx.lineWidth = 2.5; ctx.strokeStyle = getCSS('--rope');
+        ctx.beginPath();
+        const steps = Math.max(60, Math.floor((x2-x1)*pxPerM_X/8));
+        for(let i=0;i<=steps;i++){
+          const x = x1 + (x2-x1)*i/steps;
+          const y = cat.y0 + cat.a*Math.cosh((x - cat.xc)/cat.a);
+          const p = worldToCanvas(x,y);
+          if(i===0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+        }
+        ctx.stroke();
+        S_geom = cat.length; // geometric arc length
+        yMin = cat.yMin; xMin = cat.xMin;
+        // lowest point marker
+        const lp = worldToCanvas(xMin, yMin);
+        ctx.fillStyle = getCSS('--accent2');
+        ctx.beginPath(); ctx.arc(lp.x, lp.y, 5, 0, Math.PI*2); ctx.fill();
+      }
+
+      // Readout
+      const deltaL = S_geom - S_eff; // + = catenary needs more length than available
+      const tensionText = `H = ${HkN.toFixed(2)} kN,  a = ${(H/wNpm).toFixed(2)} m,  w = ${(wNpm).toFixed(2)} N/m (${rho.toFixed(3)} kg/m)`;
+      const anchorsText = `Anker links: ${y1.toFixed(2)} m | Anker rechts (Mast): ${y2.toFixed(2)} m`;
+      const lowText = isFinite(yMin) ? `Tiefster Punkt: ${yMin.toFixed(2)} m @ x=${xMin.toFixed(2)} m` : 'Tiefster Punkt: –';
+      const lenText = `Bogenlänge (geometrisch): ${S_geom.toFixed(2)} m | Effektive Seillänge (L·(1+ε)): ${S_eff.toFixed(2)} m | ΔL = ${(deltaL).toFixed(2)} m`;
+
+      outEl.innerHTML = `
+        <span class="badge">${anchorsText}</span>
+        <span class="badge">${lowText}</span>
+        <span class="badge">${lenText}</span>
+        <span class="badge">${tensionText}</span>
+      `;
+
+      // Warnings (length mismatch)
+      if(Math.abs(deltaL) > Math.max(0.5, 0.01*S_eff)){
+        const warn = `Hinweis: Die geometrische Länge und die eingestellte effektive Seillänge unterscheiden sich deutlich (ΔL).\n`+
+                     `Passe Vorspannung H, Dehnung ε oder Ankergeometrie an, um die Werte näherungsweise zu konsistent zu halten.`;
+        // Draw in corner
+        ctx.fillStyle = 'rgba(255, 196, 88, 0.9)';
+        ctx.font = '12px system-ui, sans-serif';
+        ctx.fillText('⚠ '+warn, margin.left, margin.top+14);
+      }
+
+      function drawAnchor(xm, ym, label, color, hollow=false){
+        const p = worldToCanvas(xm, ym);
+        ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, Math.PI*2);
+        if(hollow){ ctx.stroke(); } else { ctx.fill(); }
+        ctx.fillStyle = color; ctx.font = '12px system-ui, sans-serif';
+        ctx.fillText(label, p.x+10, p.y-8);
+      }
+
+      function drawGrid(pxX, pxY, spanM){
+        const w = canvas.width, h = canvas.height;
+        // background already cleared
+        // axes area
+        const x0 = margin.left, y0 = h - margin.bottom;
+        const right = w - margin.right, top = margin.top;
+        ctx.save();
+        // grid lines
+        ctx.strokeStyle = getCSS('--grid');
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        const stepX = 5; // m
+        const stepY = 1; // m
+        // vertical grid
+        for(let xm=0; xm<=spanM+1e-6; xm+=stepX){
+          const px = x0 + xm*pxX; ctx.moveTo(px, top); ctx.lineTo(px, y0);
+        }
+        // horizontal grid (show 0..10 m by default)
+        for(let ym=0; ym<=10+1e-6; ym+=stepY){
+          const py = y0 - ym*pxY; ctx.moveTo(x0, py); ctx.lineTo(right, py);
+        }
+        ctx.stroke();
+        // axes labels
+        ctx.fillStyle = getCSS('--muted');
+        ctx.font = '12px system-ui, sans-serif';
+        for(let xm=0; xm<=spanM+1e-6; xm+=stepX){
+          const px = x0 + xm*pxX; ctx.fillText(`${xm} m`, px-10, y0+16);
+        }
+        for(let ym=0; ym<=10+1e-6; ym+=stepY){
+          const py = y0 - ym*pxY; ctx.fillText(`${ym} m`, 6, py-2);
+        }
+        // ground line
+        ctx.strokeStyle = '#4b6075'; ctx.lineWidth = 1.5; ctx.beginPath();
+        ctx.moveTo(x0, y0); ctx.lineTo(right, y0); ctx.stroke();
+        ctx.restore();
+      }
+
+      function getCSS(varName){
+        return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+      }
+    }
+
+    // init
+    scheduleRender();
+  })();
+  </script>
+</body>
+</html>
